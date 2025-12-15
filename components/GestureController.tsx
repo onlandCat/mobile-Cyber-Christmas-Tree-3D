@@ -20,7 +20,6 @@ const GestureController: React.FC<GestureControllerProps> = ({ onUpdate, setAppS
   useEffect(() => {
     const initMediaPipe = async () => {
       try {
-        // Use a consistent version for WASM loading to prevent freezes
         const vision = await FilesetResolver.forVisionTasks(
           "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm"
         );
@@ -28,10 +27,7 @@ const GestureController: React.FC<GestureControllerProps> = ({ onUpdate, setAppS
         handLandmarkerRef.current = await HandLandmarker.createFromOptions(vision, {
           baseOptions: {
             modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`,
-            // CRITICAL MOBILE FIX: Use "CPU" instead of "GPU".
-            // The main 3D scene creates a heavy WebGL context. 
-            // Creating a second WebGL context for MediaPipe often freezes mobile browsers due to resource contention.
-            delegate: "CPU" 
+            delegate: "CPU" // ONLY CHANGE: Downgrade to CPU to prevent WebGL crash on mobile
           },
           runningMode: "VIDEO",
           numHands: 1
@@ -58,13 +54,10 @@ const GestureController: React.FC<GestureControllerProps> = ({ onUpdate, setAppS
 
   const startCamera = async () => {
     try {
-      // Mobile constraints: Don't force exact resolution, ask for ideal.
-      // Facing mode 'user' is standard for selfie cam.
+      // Standard constraints (Reverted: removed explicit resolution requirements)
       const constraints = {
         video: { 
-          facingMode: "user",
-          width: { ideal: 320 },
-          height: { ideal: 240 }
+          facingMode: "user"
         }
       };
 
@@ -72,8 +65,6 @@ const GestureController: React.FC<GestureControllerProps> = ({ onUpdate, setAppS
       
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
-        // Explicit play is often needed on iOS even with autoPlay attribute
-        await videoRef.current.play();
         videoRef.current.addEventListener('loadeddata', predictWebcam);
       }
     } catch (err) {
@@ -85,14 +76,7 @@ const GestureController: React.FC<GestureControllerProps> = ({ onUpdate, setAppS
   const predictWebcam = () => {
     if (!handLandmarkerRef.current || !videoRef.current || !canvasRef.current) return;
 
-    // Ensure video dimensions are ready
-    if (videoRef.current.videoWidth === 0 || videoRef.current.videoHeight === 0) {
-        requestRef.current = requestAnimationFrame(predictWebcam);
-        return;
-    }
-
-    // Dynamic resize: Mobile cameras might return different aspect ratios (e.g. portrait)
-    // We must match canvas to video source to ensure coordinates are correct
+    // Simple resize check
     if (canvasRef.current.width !== videoRef.current.videoWidth || canvasRef.current.height !== videoRef.current.videoHeight) {
         canvasRef.current.width = videoRef.current.videoWidth;
         canvasRef.current.height = videoRef.current.videoHeight;
@@ -135,25 +119,20 @@ const GestureController: React.FC<GestureControllerProps> = ({ onUpdate, setAppS
            const gesture = isPinch ? 'PINCH' : 'OPEN';
 
            // 2. Map X position for rotation
-           // On mobile/webcam, the video is often mirrored visually via CSS, but landmarks are relative to source.
-           // We map 0..1 to -1..1 range for rotation control.
            const rotationValue = (wrist.x - 0.5) * 4;
 
            // 3. State Update
            onUpdate({
              isHandDetected: true,
              gesture: gesture,
-             // Mirror X for UI cursor visual alignment if we are flipping video with CSS
              handPosition: { x: 1 - indexTip.x, y: indexTip.y }, 
              rotationValue: rotationValue
            });
 
-           // 4. Trigger App State Change (with basic debounce/hysteresis via simple check)
+           // 4. Trigger App State Change
            if (isPinch && currentAppState === AppState.EXPLODE) {
              setAppState(AppState.TREE);
            } else if (!isPinch && currentAppState === AppState.TREE) {
-             // For better UX, maybe only explode if hand opens clearly? 
-             // Keeping original logic: "OPEN" -> EXPLODE
              setAppState(AppState.EXPLODE);
            }
 
@@ -176,10 +155,6 @@ const GestureController: React.FC<GestureControllerProps> = ({ onUpdate, setAppS
       {error && <div className="text-red-500 text-xs mb-2">{error}</div>}
       
       <div className="relative border-2 border-cyan-500/50 rounded-lg overflow-hidden bg-black/80 shadow-[0_0_15px_rgba(0,255,255,0.3)] w-[120px] h-[160px] sm:w-[160px] sm:h-[120px]">
-         {/* 
-            Video hidden visually but active. 
-            playsInline and muted are CRITICAL for mobile browser support.
-         */}
          <video 
            ref={videoRef} 
            className="absolute w-full h-full object-cover transform -scale-x-100 opacity-60" 
