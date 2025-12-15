@@ -1,0 +1,203 @@
+import React, { useEffect, useRef, useState } from 'react';
+import { FilesetResolver, HandLandmarker } from '@mediapipe/tasks-vision';
+import { HandGestureState, AppState } from '../types';
+
+interface GestureControllerProps {
+  onUpdate: (state: HandGestureState) => void;
+  setAppState: (state: AppState) => void;
+  currentAppState: AppState;
+}
+
+const GestureController: React.FC<GestureControllerProps> = ({ onUpdate, setAppState, currentAppState }) => {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [loaded, setLoaded] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const lastVideoTimeRef = useRef<number>(-1);
+  const requestRef = useRef<number>(0);
+  const handLandmarkerRef = useRef<HandLandmarker | null>(null);
+
+  useEffect(() => {
+    const initMediaPipe = async () => {
+      try {
+        // Use a consistent version for WASM loading to prevent freezes
+        const vision = await FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm"
+        );
+        
+        handLandmarkerRef.current = await HandLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`,
+            // CRITICAL MOBILE FIX: Use "CPU" instead of "GPU".
+            // The main 3D scene creates a heavy WebGL context. 
+            // Creating a second WebGL context for MediaPipe often freezes mobile browsers due to resource contention.
+            delegate: "CPU" 
+          },
+          runningMode: "VIDEO",
+          numHands: 1
+        });
+        setLoaded(true);
+        startCamera();
+      } catch (e) {
+        console.error("Failed to init MediaPipe", e);
+        setError("AI Init Failed");
+      }
+    };
+
+    initMediaPipe();
+
+    return () => {
+      if (videoRef.current && videoRef.current.srcObject) {
+        const stream = videoRef.current.srcObject as MediaStream;
+        stream.getTracks().forEach(track => track.stop());
+      }
+      cancelAnimationFrame(requestRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const startCamera = async () => {
+    try {
+      // Mobile constraints: Don't force exact resolution, ask for ideal.
+      // Facing mode 'user' is standard for selfie cam.
+      const constraints = {
+        video: { 
+          facingMode: "user",
+          width: { ideal: 320 },
+          height: { ideal: 240 }
+        }
+      };
+
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        // Explicit play is often needed on iOS even with autoPlay attribute
+        await videoRef.current.play();
+        videoRef.current.addEventListener('loadeddata', predictWebcam);
+      }
+    } catch (err) {
+      console.error("Error accessing webcam:", err);
+      setError("Camera Denied");
+    }
+  };
+
+  const predictWebcam = () => {
+    if (!handLandmarkerRef.current || !videoRef.current || !canvasRef.current) return;
+
+    // Ensure video dimensions are ready
+    if (videoRef.current.videoWidth === 0 || videoRef.current.videoHeight === 0) {
+        requestRef.current = requestAnimationFrame(predictWebcam);
+        return;
+    }
+
+    // Dynamic resize: Mobile cameras might return different aspect ratios (e.g. portrait)
+    // We must match canvas to video source to ensure coordinates are correct
+    if (canvasRef.current.width !== videoRef.current.videoWidth || canvasRef.current.height !== videoRef.current.videoHeight) {
+        canvasRef.current.width = videoRef.current.videoWidth;
+        canvasRef.current.height = videoRef.current.videoHeight;
+    }
+
+    const startTimeMs = performance.now();
+    if (lastVideoTimeRef.current !== videoRef.current.currentTime) {
+      lastVideoTimeRef.current = videoRef.current.currentTime;
+      
+      const results = handLandmarkerRef.current.detectForVideo(videoRef.current, startTimeMs);
+      const ctx = canvasRef.current.getContext('2d');
+      
+      if (ctx) {
+        ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+        
+        // Draw simple skeleton for feedback
+        if (results.landmarks && results.landmarks.length > 0) {
+           const landmarks = results.landmarks[0];
+           
+           // Draw Points
+           ctx.fillStyle = "#00ffff";
+           for(const point of landmarks) {
+             ctx.beginPath();
+             ctx.arc(point.x * canvasRef.current.width, point.y * canvasRef.current.height, 3, 0, 2 * Math.PI);
+             ctx.fill();
+           }
+
+           // Logic Extraction
+           const thumbTip = landmarks[4];
+           const indexTip = landmarks[8];
+           const wrist = landmarks[0];
+
+           // 1. Calculate Pinch
+           const distance = Math.sqrt(
+             Math.pow(thumbTip.x - indexTip.x, 2) + 
+             Math.pow(thumbTip.y - indexTip.y, 2)
+           );
+           
+           const isPinch = distance < 0.05;
+           const gesture = isPinch ? 'PINCH' : 'OPEN';
+
+           // 2. Map X position for rotation
+           // On mobile/webcam, the video is often mirrored visually via CSS, but landmarks are relative to source.
+           // We map 0..1 to -1..1 range for rotation control.
+           const rotationValue = (wrist.x - 0.5) * 4;
+
+           // 3. State Update
+           onUpdate({
+             isHandDetected: true,
+             gesture: gesture,
+             // Mirror X for UI cursor visual alignment if we are flipping video with CSS
+             handPosition: { x: 1 - indexTip.x, y: indexTip.y }, 
+             rotationValue: rotationValue
+           });
+
+           // 4. Trigger App State Change (with basic debounce/hysteresis via simple check)
+           if (isPinch && currentAppState === AppState.EXPLODE) {
+             setAppState(AppState.TREE);
+           } else if (!isPinch && currentAppState === AppState.TREE) {
+             // For better UX, maybe only explode if hand opens clearly? 
+             // Keeping original logic: "OPEN" -> EXPLODE
+             setAppState(AppState.EXPLODE);
+           }
+
+        } else {
+          onUpdate({
+            isHandDetected: false,
+            gesture: 'NONE',
+            handPosition: { x: 0.5, y: 0.5 },
+            rotationValue: 0
+          });
+        }
+      }
+    }
+    requestRef.current = requestAnimationFrame(predictWebcam);
+  };
+
+  return (
+    <div className="fixed bottom-4 right-4 z-50 flex flex-col items-end pointer-events-none">
+      {!loaded && !error && <div className="text-cyan-500 text-xs animate-pulse mb-2">Initializing AI Vision...</div>}
+      {error && <div className="text-red-500 text-xs mb-2">{error}</div>}
+      
+      <div className="relative border-2 border-cyan-500/50 rounded-lg overflow-hidden bg-black/80 shadow-[0_0_15px_rgba(0,255,255,0.3)] w-[120px] h-[160px] sm:w-[160px] sm:h-[120px]">
+         {/* 
+            Video hidden visually but active. 
+            playsInline and muted are CRITICAL for mobile browser support.
+         */}
+         <video 
+           ref={videoRef} 
+           className="absolute w-full h-full object-cover transform -scale-x-100 opacity-60" 
+           autoPlay 
+           playsInline
+           muted 
+         />
+         <canvas 
+           ref={canvasRef}
+           className="absolute w-full h-full object-cover transform -scale-x-100"
+         />
+      </div>
+      <div className="mt-2 text-[10px] text-cyan-300 font-mono text-right bg-black/50 p-1 rounded">
+        <p>PINCH: FORM TREE</p>
+        <p>OPEN: EXPLODE</p>
+      </div>
+    </div>
+  );
+};
+
+export default GestureController;

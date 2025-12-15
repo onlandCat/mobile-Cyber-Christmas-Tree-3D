@@ -1,0 +1,7 @@
+{
+  "name": "mobile Cyber-Christmas Tree 3D",
+  "description": "A high-tech, interactive 3D Christmas tree experience controlled by hand gestures and mouse interactions, featuring advanced particle systems and post-processing.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
